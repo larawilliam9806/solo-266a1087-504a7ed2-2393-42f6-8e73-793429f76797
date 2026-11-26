@@ -49,6 +49,7 @@ from .engine import (
     parse_layout,
     write_directory_tar,
 )
+from .sessions import SessionNotFound, SessionStore
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -80,6 +81,9 @@ SESSION_DIR = DATA_DIR / "sessions"
 TMP_DIR = DATA_DIR / "tmp"
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ordered, batched, crash-safe storage for uploaded session layers.
+STORE = SessionStore(SESSION_DIR)
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{3,80}$")
 
@@ -143,17 +147,12 @@ def _valid_sid(sid: str) -> bool:
 
 
 def _session_path(sid: str) -> Path:
-    return SESSION_DIR / sid
+    return STORE.session_dir(sid)
 
 
 def _session_layers(sid: str) -> list[Path]:
-    sdir = _session_path(sid)
-    if not sdir.is_dir():
-        return []
-    return sorted(
-        (p for p in sdir.iterdir() if p.is_file() and p.suffix == ".tar"),
-        key=lambda p: p.name,
-    )
+    """Point-in-time snapshot of committed layers (complete batches only)."""
+    return STORE.snapshot(sid)
 
 
 def _save_upload(upload: StarletteUploadFile, dest: Path) -> None:
@@ -164,6 +163,45 @@ def _save_upload(upload: StarletteUploadFile, dest: Path) -> None:
         pass
     with open(dest, "wb") as out:
         shutil.copyfileobj(upload.file, out, length=1024 * 1024)
+        out.flush()
+        # Make the bytes durable before the batch is published.
+        try:
+            os.fsync(out.fileno())
+        except OSError:
+            pass
+
+
+def _write_batch(sid: str, seq: int, files: list[StarletteUploadFile]) -> dict:
+    """Store one upload request as a single all-or-nothing batch.
+
+    Every file is written to a private staging directory first; the batch is
+    published only once *all* of them are on disk.  Any failure discards the
+    whole staging directory and leaves previously committed batches intact.
+    """
+    staged = STORE.new_staging(sid)
+    names: list[str] = []
+    try:
+        for index, upload in enumerate(files):
+            name = f"layer_{index:04d}.tar"
+            _save_upload(upload, staged / name)
+            names.append(name)
+        if not names:
+            STORE.discard(staged)
+        else:
+            STORE.commit(sid, seq, staged, names)
+    except BaseException:
+        STORE.discard(staged)
+        raise
+    return {"added": len(names)}
+
+
+def _release_uploads(files: list[StarletteUploadFile]) -> None:
+    """Close spooled temp files promptly so large batches do not leak fds."""
+    for upload in files:
+        try:
+            upload.file.close()
+        except Exception:
+            pass
 
 
 def _decode_b64_layer(item: Any, index: int, req_dir: Path) -> Path:
@@ -214,6 +252,8 @@ def _cleanup_old_temp(max_age_seconds: int = 3600) -> None:
 @app.on_event("startup")
 def _startup() -> None:
     _cleanup_old_temp()
+    # Drop half-written batches left by a process that died mid-upload.
+    STORE.cleanup_stale_staging()
 
 
 # ---------------------------------------------------------------------------
@@ -539,22 +579,29 @@ for _p in _EXTRACT_PATHS:
 @app.post("/api/session")
 async def create_session(request: Request) -> JSONResponse:
     sid = uuid.uuid4().hex
-    sdir = _session_path(sid)
-    sdir.mkdir(parents=True, exist_ok=False)
+    STORE.create(sid)
 
     # Allow creating + uploading the first layers in one request.
-    if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.startswith("multipart/form-data"):
+        # Reserve the batch's position before touching the body.
+        seq = STORE.allocate_seq(sid)
         try:
             form = await request.form()
         except Exception as exc:
             return _error_response(400, "invalid_request", str(exc), None)
-        index = 0
-        for _field, value in form.multi_items():
-            if isinstance(value, StarletteUploadFile):
-                dest = sdir / f"layer_{index:04d}.tar"
-                _save_upload(value, dest)
-                index += 1
-        return JSONResponse({"session_id": sid, "id": sid, "layers": index})
+        files = [v for _f, v in form.multi_items() if isinstance(v, StarletteUploadFile)]
+        from fastapi.concurrency import run_in_threadpool
+
+        try:
+            result = await run_in_threadpool(_write_batch, sid, seq, files)
+        except Exception as exc:  # staging discarded by _write_batch
+            return _error_response(500, "upload_failed", repr(exc), None)
+        finally:
+            _release_uploads(files)
+        return JSONResponse(
+            {"session_id": sid, "id": sid, "layers": result["added"]}
+        )
 
     return JSONResponse({"session_id": sid, "id": sid, "layers": 0})
 
@@ -568,24 +615,41 @@ async def upload_session_layers(sid: str, request: Request) -> JSONResponse:
     if not _valid_sid(sid) or not _session_path(sid).is_dir():
         return _error_response(404, "session_not_found", f"unknown session: {sid}", None)
 
-    sdir = _session_path(sid)
-    existing = len(_session_layers(sid))
+    # Reserve this request's position in submission order *before* reading the
+    # body.  A later-starting batch can never jump ahead of an earlier one,
+    # even if it finishes writing first.
+    try:
+        seq = STORE.allocate_seq(sid)
+    except SessionNotFound:
+        return _error_response(404, "session_not_found", f"unknown session: {sid}", None)
+
     try:
         form = await request.form()
     except Exception as exc:
         return _error_response(400, "invalid_request", str(exc), None)
 
-    added = 0
-    # Clients may pass an explicit ordering; otherwise wire order + next index.
-    for _field, value in form.multi_items():
-        if isinstance(value, StarletteUploadFile):
-            dest = sdir / f"layer_{existing + added:04d}.tar"
-            _save_upload(value, dest)
-            added += 1
+    # Form order is layer order within the batch.
+    files = [v for _f, v in form.multi_items() if isinstance(v, StarletteUploadFile)]
 
-    total = len(_session_layers(sid))
+    from fastapi.concurrency import run_in_threadpool
+
+    try:
+        result = await run_in_threadpool(_write_batch, sid, seq, files)
+    except SessionNotFound:
+        return _error_response(404, "session_not_found", f"unknown session: {sid}", None)
+    except Exception as exc:
+        return _error_response(500, "upload_failed", repr(exc), None)
+    finally:
+        _release_uploads(files)
+
+    order = STORE.display_order(sid)
     return JSONResponse(
-        {"session_id": sid, "added": added, "layers": total, "order": [p.name for p in _session_layers(sid)]}
+        {
+            "session_id": sid,
+            "added": result["added"],
+            "layers": len(order),
+            "order": order,
+        }
     )
 
 
@@ -647,8 +711,7 @@ async def session_extract(sid: str, request: Request) -> Response:
 async def delete_session(sid: str) -> JSONResponse:
     if not _valid_sid(sid):
         return _error_response(404, "session_not_found", f"unknown session: {sid}", None)
-    sdir = _session_path(sid)
-    shutil.rmtree(sdir, ignore_errors=True)
+    STORE.delete(sid)
     return JSONResponse({"deleted": sid})
 
 
@@ -669,29 +732,41 @@ async def flat_upload(request: Request) -> JSONResponse:
     if not _valid_sid(sid):
         return _error_response(400, "invalid_session", f"invalid session id: {sid}", None)
 
-    sdir = _session_path(sid)
-    sdir.mkdir(parents=True, exist_ok=True)
+    try:
+        # /upload keeps its historical behaviour of creating the target stack
+        # on demand (the shared "default" stack in particular).
+        STORE.ensure(sid)
+        # Reserve submission order before reading the body.
+        seq = STORE.allocate_seq(sid)
+    except SessionNotFound:
+        return _error_response(404, "session_not_found", f"unknown session: {sid}", None)
+
     try:
         form = await request.form()
     except Exception as exc:
         return _error_response(400, "invalid_request", str(exc), None)
 
-    added = 0
-    index = len(_session_layers(sid))
-    for _field, value in form.multi_items():
-        if isinstance(value, StarletteUploadFile):
-            dest = sdir / f"layer_{index + added:04d}.tar"
-            _save_upload(value, dest)
-            added += 1
+    files = [v for _f, v in form.multi_items() if isinstance(v, StarletteUploadFile)]
 
-    total = len(_session_layers(sid))
+    from fastapi.concurrency import run_in_threadpool
+
+    try:
+        result = await run_in_threadpool(_write_batch, sid, seq, files)
+    except SessionNotFound:
+        return _error_response(404, "session_not_found", f"unknown session: {sid}", None)
+    except Exception as exc:
+        return _error_response(500, "upload_failed", repr(exc), None)
+    finally:
+        _release_uploads(files)
+
+    order = STORE.display_order(sid)
     resp = JSONResponse(
         {
             "session_id": sid,
             "id": sid,
-            "added": added,
-            "layers": total,
-            "order": [p.name for p in _session_layers(sid)],
+            "added": result["added"],
+            "layers": len(order),
+            "order": order,
             "download": f"/sessions/{sid}/download?path=/your/dir",
             "extract_url": f"/sessions/{sid}/extract",
             "hint": "then POST /extract with form field path and session_id=" + sid
